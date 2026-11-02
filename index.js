@@ -1,11 +1,20 @@
 
 import express from 'express';
-import { MongoClient } from 'mongodb';
-import { ObjectId } from 'mongodb';
+import { MongoClient, ObjectId } from 'mongodb';
+import cors from 'cors';
 import 'dotenv/config'
+
 const app = express()
 const port = 8000
+
+app.use(cors({
+    origin: 'http://localhost:3000'
+}));
+
+app.use(express.json());
+
 const client = new MongoClient(process.env.MONGODB_URI);
+
 export async function connectToMongoDB() {
     try {
         await client.connect();
@@ -15,12 +24,17 @@ export async function connectToMongoDB() {
         console.dir(err);
     }
 }
+
 const mongoClient = await connectToMongoDB();
 const db = mongoClient.db('Studiospace');
+
 const collection = db.collection('available');
+const bookingsCollection = db.collection('bookings');
+
 app.get('/', (req, res) => {
     res.send('Hello World!')
 })
+
 app.get('/alldata', async (req, res) => {
     try {
         const spaces = await collection.find().toArray();
@@ -66,7 +80,34 @@ app.get('/studios/:id', async (req, res) => {
             error: err.message
         });
     }
-});
+})
+
+app.post('/bookings', async (req, res) => {
+    try {
+        const booking = {
+            ...req.body,
+            status: 'pending',
+            createdAt: new Date()
+        };
+
+        const result = await bookingsCollection.insertOne(booking);
+
+        res.status(201).json({
+            success: true,
+            message: 'Booking successful',
+            insertedId: result.insertedId
+        });
+
+    } catch (err) {
+        console.error(err);
+
+        res.status(500).json({
+            success: false,
+            message: 'Booking failed'
+        });
+    }
+})
+
 app.listen(port, () => {
-    console.log(`Example app listening on port ${port}`)
+    console.log(`Example app listening on port ${port} `)
 })
