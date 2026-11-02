@@ -280,6 +280,22 @@ app.get('/studios/my-studios', async (req, res) => {
         res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
+app.delete('/studios/:id', async (req, res) => {
+    try {
+        const id = req.params.id;
+        const { ObjectId } = require('mongodb');
+        const query = { _id: new ObjectId(id) };
+        const result = await collection.deleteOne(query);
+
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ success: false, message: 'Studio not found' });
+        }
+        res.status(200).json({ success: true, message: 'Studio deleted successfully' });
+    } catch (err) {
+        console.error('Error deleting studio:', err);
+        res.status(500).json({ success: false, message: 'Internal server error' });
+    }
+});
 app.listen(port, () => {
     console.log(`Example app listening on port ${port} `)
 })
