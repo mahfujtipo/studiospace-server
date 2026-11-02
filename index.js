@@ -37,13 +37,25 @@ app.get('/', (req, res) => {
 app.get('/alldata', async (req, res) => {
     try {
         const spaces = await collection.find().toArray();
-
         res.status(200).json(spaces);
     } catch (err) {
         console.error(err);
-
         res.status(500).json({
             message: 'Failed to fetch data',
+            error: err.message
+        });
+    }
+})
+
+// ড্যাশবোর্ডের জন্য টোটাল স্টুডিও কাউন্ট রাউট (এটি মিসিং ছিল)
+app.get('/spaces', async (req, res) => {
+    try {
+        const spaces = await collection.find().toArray();
+        res.status(200).json({ spaces });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({
+            message: 'Failed to fetch spaces',
             error: err.message
         });
     }
@@ -73,7 +85,6 @@ app.get('/studios/:id', async (req, res) => {
 
     } catch (err) {
         console.error(err);
-
         res.status(500).json({
             message: 'Failed to fetch studio',
             error: err.message
@@ -82,11 +93,9 @@ app.get('/studios/:id', async (req, res) => {
 })
 
 // Create Booking
-// Create Booking
 app.post('/bookings', async (req, res) => {
     console.log("BACKEND RECEIVED BODY:", req.body);
     try {
-        // ফ্লেক্সিবল করা হলো যাতে id বা studioId দুটোই কাজ করে
         const studioId = req.body.studioId || req.body.id;
         const {
             bookingDate,
@@ -163,7 +172,7 @@ app.post('/bookings', async (req, res) => {
         // Save booking
         const booking = {
             ...req.body,
-            studioId: new ObjectId(studioId), // সঠিক অবজেক্টআইডি ফরম্যাটে সেভ হবে
+            studioId: new ObjectId(studioId),
             status: 'pending',
             createdAt: new Date()
         };
@@ -178,7 +187,6 @@ app.post('/bookings', async (req, res) => {
 
     } catch (err) {
         console.error(err);
-
         res.status(500).json({
             success: false,
             message: 'Booking failed',
@@ -186,6 +194,8 @@ app.post('/bookings', async (req, res) => {
         });
     }
 })
+
+// Get Bookings by User Email
 app.get('/bookings/my-bookings', async (req, res) => {
     try {
         const userEmail = req.query.email;
@@ -205,6 +215,58 @@ app.get('/bookings/my-bookings', async (req, res) => {
         });
     }
 });
+
+app.post('/studios', async (req, res) => {
+    try {
+        const {
+            studioName,
+            category,
+            pricePerHour,
+            location,
+            description,
+            image,
+            userEmail,
+            userName
+        } = req.body;
+
+        // Input validation
+        if (!studioName || !pricePerHour || !location || !userEmail) {
+            return res.status(400).json({
+                success: false,
+                message: 'Please provide all required fields'
+            });
+        }
+
+        const newStudio = {
+            studioName,
+            category: category || 'General',
+            pricePerHour: Number(pricePerHour),
+            location,
+            description: description || '',
+            image: image || '',
+            hostEmail: userEmail,
+            hostName: userName || 'Host',
+            createdAt: new Date()
+        };
+
+        const result = await collection.insertOne(newStudio);
+
+        res.status(201).json({
+            success: true,
+            message: 'Studio added successfully',
+            insertedId: result.insertedId
+        });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to add studio',
+            error: err.message
+        });
+    }
+});
+
 app.listen(port, () => {
     console.log(`Example app listening on port ${port} `)
 })
