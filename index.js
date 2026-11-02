@@ -1,4 +1,3 @@
-
 import express from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from 'cors';
@@ -83,10 +82,13 @@ app.get('/studios/:id', async (req, res) => {
 })
 
 // Create Booking
+// Create Booking
 app.post('/bookings', async (req, res) => {
+    console.log("BACKEND RECEIVED BODY:", req.body);
     try {
+        // ফ্লেক্সিবল করা হলো যাতে id বা studioId দুটোই কাজ করে
+        const studioId = req.body.studioId || req.body.id;
         const {
-            studioId,
             bookingDate,
             startTime,
             endTime
@@ -107,7 +109,7 @@ app.post('/bookings', async (req, res) => {
 
         // Validate date
         const datePattern = /^\d{4}-\d{2}-\d{2}$/;
-        const date = new Date(`${bookingDate} T00:00:00Z`);
+        const date = new Date(`${bookingDate}T00:00:00Z`);
 
         if (
             !datePattern.test(bookingDate) ||
@@ -161,7 +163,7 @@ app.post('/bookings', async (req, res) => {
         // Save booking
         const booking = {
             ...req.body,
-            studioId: new ObjectId(studioId),
+            studioId: new ObjectId(studioId), // সঠিক অবজেক্টআইডি ফরম্যাটে সেভ হবে
             status: 'pending',
             createdAt: new Date()
         };
@@ -179,11 +181,30 @@ app.post('/bookings', async (req, res) => {
 
         res.status(500).json({
             success: false,
-            message: 'Booking failed'
+            message: 'Booking failed',
+            error: err.message
         });
     }
 })
+app.get('/bookings/my-bookings', async (req, res) => {
+    try {
+        const userEmail = req.query.email;
 
+        let query = {};
+        if (userEmail) {
+            query = { userEmail: userEmail };
+        }
+        const bookings = await bookingsCollection.find(query).toArray();
+
+        res.status(200).json(bookings);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({
+            message: 'Failed to fetch user bookings',
+            error: err.message
+        });
+    }
+});
 app.listen(port, () => {
     console.log(`Example app listening on port ${port} `)
 })
