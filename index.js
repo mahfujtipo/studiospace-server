@@ -82,10 +82,86 @@ app.get('/studios/:id', async (req, res) => {
     }
 })
 
+// Create Booking
 app.post('/bookings', async (req, res) => {
     try {
+        const {
+            studioId,
+            bookingDate,
+            startTime,
+            endTime
+        } = req.body;
+
+        // Input validation
+        if (!studioId || !bookingDate || !startTime || !endTime) {
+            return res.status(400).json({
+                message: 'Please provide all required information'
+            });
+        }
+
+        if (!ObjectId.isValid(studioId)) {
+            return res.status(400).json({
+                message: 'Invalid studio ID'
+            });
+        }
+
+        // Validate date
+        const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+        const date = new Date(`${bookingDate} T00:00:00Z`);
+
+        if (
+            !datePattern.test(bookingDate) ||
+            isNaN(date.getTime()) ||
+            date.toISOString().slice(0, 10) !== bookingDate
+        ) {
+            return res.status(400).json({
+                message: 'Invalid booking date'
+            });
+        }
+
+        // Validate time
+        const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+        if (
+            !timePattern.test(startTime) ||
+            !timePattern.test(endTime) ||
+            startTime >= endTime
+        ) {
+            return res.status(400).json({
+                message: 'Invalid booking time'
+            });
+        }
+
+        // Check if studio exists
+        const studio = await collection.findOne({
+            _id: new ObjectId(studioId)
+        });
+
+        if (!studio) {
+            return res.status(404).json({
+                message: 'Studio not found'
+            });
+        }
+
+        // Check time-slot conflict
+        const existingBooking = await bookingsCollection.findOne({
+            studioId: new ObjectId(studioId),
+            bookingDate,
+            status: { $in: ['pending', 'confirmed'] },
+            startTime: { $lt: endTime },
+            endTime: { $gt: startTime }
+        });
+
+        if (existingBooking) {
+            return res.status(409).json({
+                message: 'This time slot is already booked'
+            });
+        }
+
+        // Save booking
         const booking = {
             ...req.body,
+            studioId: new ObjectId(studioId),
             status: 'pending',
             createdAt: new Date()
         };
