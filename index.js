@@ -266,7 +266,20 @@ app.post('/studios', async (req, res) => {
         });
     }
 });
-
+app.get('/studios/my-studios', async (req, res) => {
+    try {
+        const { email } = req.query;
+        if (!email) {
+            return res.status(400).json({ success: false, message: 'Email query parameter is required' });
+        }
+        const query = { ownerEmail: email };
+        const userStudios = await collection.find(query).toArray();
+        res.status(200).json(userStudios);
+    } catch (err) {
+        console.error('Error fetching user studios:', err);
+        res.status(500).json({ success: false, message: 'Internal server error' });
+    }
+});
 app.listen(port, () => {
     console.log(`Example app listening on port ${port} `)
 })
