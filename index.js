@@ -34,7 +34,6 @@ app.get('/', (req, res) => {
     res.send('Hello World!');
 });
 
-// 🔄 Updated with dynamic expiration check
 app.get('/alldata', async (req, res) => {
     try {
         const now = new Date();
@@ -193,9 +192,34 @@ app.get('/bookings/my-bookings', async (req, res) => {
         if (userEmail) {
             query = { userEmail: userEmail };
         }
+
+        const now = new Date();
         const bookings = await bookingsCollection.find(query).toArray();
 
-        res.status(200).json(bookings);
+        for (const booking of bookings) {
+            const bookingEnd = new Date(`${booking.bookingDate}T${booking.endTime}:00+06:00`);
+
+            if (now > bookingEnd) {
+                await bookingsCollection.deleteOne({ _id: booking._id });
+
+                const remainingBooking = await bookingsCollection.findOne({
+                    studioId: booking.studioId,
+                    status: { $in: ['pending', 'confirmed'] }
+                });
+
+                await collection.updateOne(
+                    { _id: booking.studioId },
+                    { $set: { status: remainingBooking ? 'booked' : 'available' } }
+                );
+            }
+        }
+
+        const activeBookings = bookings.filter(booking => {
+            const bookingEnd = new Date(`${booking.bookingDate}T${booking.endTime}:00+06:00`);
+            return now <= bookingEnd;
+        });
+
+        res.status(200).json(activeBookings);
     } catch (err) {
         console.error(err);
         res.status(500).json({
@@ -260,7 +284,6 @@ app.post('/studios', async (req, res) => {
     }
 });
 
-// 🔄 Updated with dynamic expiration check for host studios
 app.get('/studios/my-studios', async (req, res) => {
     try {
         const { email } = req.query;
@@ -298,7 +321,45 @@ app.get('/studios/my-studios', async (req, res) => {
         res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
+app.put('/studios/:id', async (req, res) => {
+    try {
+        const studioId = req.params.id;
 
+        if (!ObjectId.isValid(studioId)) {
+            return res.status(400).json({ message: "Invalid studio ID format" });
+        }
+
+        const updatedData = req.body;
+
+        const query = { _id: new ObjectId(studioId) };
+        const updateDoc = {
+            $set: {
+                title: updatedData.title,
+                category: updatedData.category,
+                hourlyRate: Number(updatedData.hourlyRate || 0),
+                securityDeposit: Number(updatedData.securityDeposit || 0),
+                maxCapacity: Number(updatedData.maxCapacity || 1),
+                location: updatedData.location,
+                imageUrl: updatedData.imageUrl,
+                amenities: updatedData.amenities,
+                overview: updatedData.description,
+                updatedAt: new Date()
+            },
+        };
+
+        // 'studiosCollection'-এর বদলে আপনার আসল কালেকশন ভেরিয়েবল 'collection' ব্যবহার করা হয়েছে
+        const result = await collection.updateOne(query, updateDoc);
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ message: "Studio not found" });
+        }
+
+        res.status(200).json({ message: "Studio updated successfully", result });
+    } catch (error) {
+        console.error("Update Studio Error:", error);
+        res.status(500).json({ message: "Failed to update studio", error: error.message });
+    }
+});
 app.delete('/studios/:id', async (req, res) => {
     try {
         const id = req.params.id;
@@ -315,7 +376,6 @@ app.delete('/studios/:id', async (req, res) => {
     }
 });
 
-// 🔄 Updated with dynamic expiration check for single studio view
 app.get('/studios/:id', async (req, res) => {
     try {
         const id = req.params.id;
@@ -366,6 +426,7 @@ app.get('/studios/:id', async (req, res) => {
         });
     }
 });
+
 app.delete('/bookings/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -385,7 +446,6 @@ app.delete('/bookings/:id', async (req, res) => {
             });
         }
 
-        // Find booking belonging to this user
         const booking = await bookingsCollection.findOne({
             _id: new ObjectId(id),
             userEmail: email
@@ -400,7 +460,6 @@ app.delete('/bookings/:id', async (req, res) => {
 
         const { bookingDate, startTime, endTime } = booking;
 
-        // Validate date and time
         const datePattern = /^\d{4}-\d{2}-\d{2}$/;
         const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
 
@@ -416,7 +475,6 @@ app.delete('/bookings/:id', async (req, res) => {
             });
         }
 
-        // Bangladesh timezone (UTC+06:00)
         const bookingStart = new Date(
             `${bookingDate}T${startTime}:00+06:00`
         );
@@ -427,7 +485,6 @@ app.delete('/bookings/:id', async (req, res) => {
 
         const now = new Date();
 
-        // Prevent deletion during active booking
         if (now >= bookingStart && now < bookingEnd) {
             return res.status(403).json({
                 success: false,
@@ -435,7 +492,6 @@ app.delete('/bookings/:id', async (req, res) => {
             });
         }
 
-        // Delete booking
         const result = await bookingsCollection.deleteOne({
             _id: new ObjectId(id),
             userEmail: email
@@ -448,7 +504,6 @@ app.delete('/bookings/:id', async (req, res) => {
             });
         }
 
-        // Update studio status based on remaining bookings
         const remainingBooking = await bookingsCollection.findOne({
             studioId: booking.studioId,
             status: { $in: ['pending', 'confirmed'] }
@@ -477,6 +532,7 @@ app.delete('/bookings/:id', async (req, res) => {
         });
     }
 });
+
 app.listen(port, () => {
     console.log(`Example app listening on port ${port}`);
 });
