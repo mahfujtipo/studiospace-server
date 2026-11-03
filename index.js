@@ -4,10 +4,23 @@ import cors from 'cors';
 import 'dotenv/config';
 
 const app = express();
-const port = 8000;
+const port = process.env.PORT || 8000;
+const allowedOrigins = [
+    process.env.CLIENT_URI,
+    'http://localhost:3000',
+    'http://localhost:3001'
+].filter(Boolean);
 
 app.use(cors({
-    origin: 'http://localhost:3000'
+    origin: function (origin, callback) {
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV !== 'production') {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true
 }));
 
 app.use(express.json());
@@ -31,7 +44,7 @@ const collection = db.collection('available');
 const bookingsCollection = db.collection('bookings');
 
 app.get('/', (req, res) => {
-    res.send('Hello World!');
+    res.send('StudioSpace Backend is running successfully!');
 });
 
 app.get('/alldata', async (req, res) => {
@@ -321,6 +334,7 @@ app.get('/studios/my-studios', async (req, res) => {
         res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
+
 app.put('/studios/:id', async (req, res) => {
     try {
         const studioId = req.params.id;
@@ -347,7 +361,6 @@ app.put('/studios/:id', async (req, res) => {
             },
         };
 
-        // 'studiosCollection'-এর বদলে আপনার আসল কালেকশন ভেরিয়েবল 'collection' ব্যবহার করা হয়েছে
         const result = await collection.updateOne(query, updateDoc);
 
         if (result.matchedCount === 0) {
@@ -360,6 +373,7 @@ app.put('/studios/:id', async (req, res) => {
         res.status(500).json({ message: "Failed to update studio", error: error.message });
     }
 });
+
 app.delete('/studios/:id', async (req, res) => {
     try {
         const id = req.params.id;
@@ -475,14 +489,8 @@ app.delete('/bookings/:id', async (req, res) => {
             });
         }
 
-        const bookingStart = new Date(
-            `${bookingDate}T${startTime}:00+06:00`
-        );
-
-        const bookingEnd = new Date(
-            `${bookingDate}T${endTime}:00+06:00`
-        );
-
+        const bookingStart = new Date(`${bookingDate}T${startTime}:00+06:00`);
+        const bookingEnd = new Date(`${bookingDate}T${endTime}:00+06:00`);
         const now = new Date();
 
         if (now >= bookingStart && now < bookingEnd) {
@@ -525,7 +533,6 @@ app.delete('/bookings/:id', async (req, res) => {
 
     } catch (err) {
         console.error('Booking deletion error:', err);
-
         res.status(500).json({
             success: false,
             message: 'Failed to delete booking'
@@ -534,5 +541,6 @@ app.delete('/bookings/:id', async (req, res) => {
 });
 
 app.listen(port, () => {
-    console.log(`Example app listening on port ${port}`);
+    console.log(`Server is running smoothly on port ${port}`);
 });
+export default app;
