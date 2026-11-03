@@ -1,3 +1,4 @@
+
 import express from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from 'cors';
@@ -5,43 +6,129 @@ import 'dotenv/config';
 
 const app = express();
 const port = process.env.PORT || 8000;
+
 const allowedOrigins = [
     process.env.CLIENT_URI,
-    'http://localhost:3000',
-    'http://localhost:3001'
+    ...(process.env.NODE_ENV !== 'production'
+        ? ['http://localhost:3000', 'http://localhost:3001']
+        : [])
 ].filter(Boolean);
 
 app.use(cors({
     origin: function (origin, callback) {
-        if (!origin) return callback(null, true);
-        if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV !== 'production') {
-            callback(null, true);
-        } else {
-            callback(new Error('Not allowed by CORS'));
+        if (!origin || allowedOrigins.includes(origin)) {
+            return callback(null, true);
         }
+
+        return callback(new Error('Not allowed by CORS'));
     },
     credentials: true
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+
+if (!process.env.MONGODB_URI) {
+    throw new Error('MONGODB_URI is missing from environment variables');
+}
 
 const client = new MongoClient(process.env.MONGODB_URI);
 
+let connectionPromise;
+
 export async function connectToMongoDB() {
+    if (!connectionPromise) {
+        connectionPromise = client.connect().catch((err) => {
+            connectionPromise = null;
+            throw err;
+        });
+    }
+
     try {
-        await client.connect();
-        console.log("You successfully connected to MongoDB!");
+        await connectionPromise;
+        console.log('You successfully connected to MongoDB!');
         return client;
     } catch (err) {
-        console.dir(err);
+        console.error('MongoDB connection failed:', err);
+        throw err;
     }
 }
 
 const mongoClient = await connectToMongoDB();
+
 const db = mongoClient.db('Studiospace');
 
 const collection = db.collection('available');
 const bookingsCollection = db.collection('bookings');
+
+function getBookingDateTime(date, time) {
+    return new Date(`${date}T${time}:00+06:00`);
+}
+
+function isValidBookingDate(date) {
+    if (typeof date !== 'string') return false;
+
+    const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+
+    if (!datePattern.test(date)) return false;
+
+    const parsedDate = new Date(`${date}T00:00:00Z`);
+
+    return (
+        !isNaN(parsedDate.getTime()) &&
+        parsedDate.toISOString().slice(0, 10) === date
+    );
+}
+
+function isValidBookingTime(time) {
+    return (
+        typeof time === 'string' &&
+        /^([01]\d|2[0-3]):[0-5]\d$/.test(time)
+    );
+}
+
+function isValidObjectId(id) {
+    return typeof id === 'string' && ObjectId.isValid(id);
+}
+
+function isValidNumber(value, min = 0) {
+    const number = Number(value);
+
+    return Number.isFinite(number) && number >= min;
+}
+
+async function refreshStudioStatus(studioId) {
+    const now = new Date();
+
+    const bookings = await bookingsCollection.find({
+        studioId,
+        status: { $in: ['pending', 'confirmed'] }
+    }).toArray();
+
+    const hasRemainingBooking = bookings.some((booking) => {
+        if (
+            !isValidBookingDate(booking.bookingDate) ||
+            !isValidBookingTime(booking.endTime)
+        ) {
+            return false;
+        }
+
+        return getBookingDateTime(
+            booking.bookingDate,
+            booking.endTime
+        ) > now;
+    });
+
+    await collection.updateOne(
+        { _id: studioId },
+        {
+            $set: {
+                status: hasRemainingBooking ? 'booked' : 'available'
+            }
+        }
+    );
+
+    return hasRemainingBooking ? 'booked' : 'available';
+}
 
 app.get('/', (req, res) => {
     res.send('StudioSpace Backend is running successfully!');
@@ -49,33 +136,28 @@ app.get('/', (req, res) => {
 
 app.get('/alldata', async (req, res) => {
     try {
-        const now = new Date();
         const spaces = await collection.find().toArray();
 
-        const updatedSpaces = await Promise.all(spaces.map(async (studio) => {
-            if (studio.status === 'booked') {
-                const activeBooking = await bookingsCollection.findOne({
-                    studioId: studio._id,
-                    status: { $in: ['pending', 'confirmed'] }
-                });
+        const updatedSpaces = await Promise.all(
+            spaces.map(async (studio) => {
+                let currentStatus = studio.status || 'available';
 
-                if (activeBooking) {
-                    const bookingEndDateTime = new Date(`${activeBooking.bookingDate}T${activeBooking.endTime}:00Z`);
-                    if (now > bookingEndDateTime) {
-                        await collection.updateOne({ _id: studio._id }, { $set: { status: 'available' } });
-                        return { ...studio, status: 'available' };
-                    }
-                } else {
-                    await collection.updateOne({ _id: studio._id }, { $set: { status: 'available' } });
-                    return { ...studio, status: 'available' };
+                if (currentStatus === 'booked') {
+                    currentStatus = await refreshStudioStatus(studio._id);
                 }
-            }
-            return { ...studio, status: studio.status || 'available' };
-        }));
+
+                return {
+                    ...studio,
+                    status: currentStatus
+                };
+            })
+        );
 
         res.status(200).json(updatedSpaces);
+
     } catch (err) {
-        console.error(err);
+        console.error('Fetch all spaces error:', err);
+
         res.status(500).json({
             message: 'Failed to fetch data',
             error: err.message
@@ -86,9 +168,12 @@ app.get('/alldata', async (req, res) => {
 app.get('/spaces', async (req, res) => {
     try {
         const spaces = await collection.find().toArray();
+
         res.status(200).json({ spaces });
+
     } catch (err) {
-        console.error(err);
+        console.error('Fetch spaces error:', err);
+
         res.status(500).json({
             message: 'Failed to fetch spaces',
             error: err.message
@@ -97,9 +182,9 @@ app.get('/spaces', async (req, res) => {
 });
 
 app.post('/bookings', async (req, res) => {
-    console.log("BACKEND RECEIVED BODY:", req.body);
     try {
         const studioId = req.body.studioId || req.body.id;
+
         const {
             bookingDate,
             startTime,
@@ -112,30 +197,21 @@ app.post('/bookings', async (req, res) => {
             });
         }
 
-        if (!ObjectId.isValid(studioId)) {
+        if (!isValidObjectId(studioId)) {
             return res.status(400).json({
                 message: 'Invalid studio ID'
             });
         }
 
-        const datePattern = /^\d{4}-\d{2}-\d{2}$/;
-        const date = new Date(`${bookingDate}T00:00:00Z`);
-
-        if (
-            !datePattern.test(bookingDate) ||
-            isNaN(date.getTime()) ||
-            date.toISOString().slice(0, 10) !== bookingDate
-        ) {
+        if (!isValidBookingDate(bookingDate)) {
             return res.status(400).json({
                 message: 'Invalid booking date'
             });
         }
 
-        const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
-
         if (
-            !timePattern.test(startTime) ||
-            !timePattern.test(endTime) ||
+            !isValidBookingTime(startTime) ||
+            !isValidBookingTime(endTime) ||
             startTime >= endTime
         ) {
             return res.status(400).json({
@@ -143,8 +219,10 @@ app.post('/bookings', async (req, res) => {
             });
         }
 
+        const studioObjectId = new ObjectId(studioId);
+
         const studio = await collection.findOne({
-            _id: new ObjectId(studioId)
+            _id: studioObjectId
         });
 
         if (!studio) {
@@ -154,7 +232,7 @@ app.post('/bookings', async (req, res) => {
         }
 
         const existingBooking = await bookingsCollection.findOne({
-            studioId: new ObjectId(studioId),
+            studioId: studioObjectId,
             bookingDate,
             status: { $in: ['pending', 'confirmed'] },
             startTime: { $lt: endTime },
@@ -169,17 +247,14 @@ app.post('/bookings', async (req, res) => {
 
         const booking = {
             ...req.body,
-            studioId: new ObjectId(studioId),
+            studioId: studioObjectId,
             status: 'pending',
             createdAt: new Date()
         };
 
         const result = await bookingsCollection.insertOne(booking);
 
-        await collection.updateOne(
-            { _id: new ObjectId(studioId) },
-            { $set: { status: 'booked' } }
-        );
+        await refreshStudioStatus(studioObjectId);
 
         res.status(201).json({
             success: true,
@@ -188,7 +263,8 @@ app.post('/bookings', async (req, res) => {
         });
 
     } catch (err) {
-        console.error(err);
+        console.error('Create booking error:', err);
+
         res.status(500).json({
             success: false,
             message: 'Booking failed',
@@ -201,40 +277,76 @@ app.get('/bookings/my-bookings', async (req, res) => {
     try {
         const userEmail = req.query.email;
 
-        let query = {};
-        if (userEmail) {
-            query = { userEmail: userEmail };
+        if (!userEmail || typeof userEmail !== 'string') {
+            return res.status(400).json({
+                success: false,
+                message: 'User email is required'
+            });
         }
 
         const now = new Date();
-        const bookings = await bookingsCollection.find(query).toArray();
+
+        const bookings = await bookingsCollection.find({
+            userEmail
+        }).toArray();
+
+        const expiredBookingIds = [];
+        const activeBookings = [];
 
         for (const booking of bookings) {
-            const bookingEnd = new Date(`${booking.bookingDate}T${booking.endTime}:00+06:00`);
+            if (
+                !isValidBookingDate(booking.bookingDate) ||
+                !isValidBookingTime(booking.endTime)
+            ) {
+                activeBookings.push(booking);
+                continue;
+            }
+
+            const bookingEnd = getBookingDateTime(
+                booking.bookingDate,
+                booking.endTime
+            );
 
             if (now > bookingEnd) {
-                await bookingsCollection.deleteOne({ _id: booking._id });
-
-                const remainingBooking = await bookingsCollection.findOne({
-                    studioId: booking.studioId,
-                    status: { $in: ['pending', 'confirmed'] }
-                });
-
-                await collection.updateOne(
-                    { _id: booking.studioId },
-                    { $set: { status: remainingBooking ? 'booked' : 'available' } }
-                );
+                expiredBookingIds.push(booking._id);
+            } else {
+                activeBookings.push(booking);
             }
         }
 
-        const activeBookings = bookings.filter(booking => {
-            const bookingEnd = new Date(`${booking.bookingDate}T${booking.endTime}:00+06:00`);
-            return now <= bookingEnd;
-        });
+        if (expiredBookingIds.length > 0) {
+            await bookingsCollection.deleteMany({
+                _id: { $in: expiredBookingIds },
+                userEmail
+            });
+
+            const affectedStudioIds = [
+                ...new Map(
+                    bookings
+                        .filter((booking) =>
+                            expiredBookingIds.some(
+                                (id) => id.equals(booking._id)
+                            )
+                        )
+                        .map((booking) => [
+                            booking.studioId.toString(),
+                            booking.studioId
+                        ])
+                ).values()
+            ];
+
+            await Promise.all(
+                affectedStudioIds.map((studioId) =>
+                    refreshStudioStatus(studioId)
+                )
+            );
+        }
 
         res.status(200).json(activeBookings);
+
     } catch (err) {
-        console.error(err);
+        console.error('Fetch user bookings error:', err);
+
         res.status(500).json({
             message: 'Failed to fetch user bookings',
             error: err.message
@@ -257,20 +369,42 @@ app.post('/studios', async (req, res) => {
             userName
         } = req.body;
 
-        if (!studioName || !pricePerHour || !location || !userEmail) {
+        if (
+            !studioName ||
+            typeof studioName !== 'string' ||
+            !location ||
+            typeof location !== 'string' ||
+            !userEmail ||
+            typeof userEmail !== 'string' ||
+            pricePerHour === undefined ||
+            pricePerHour === null ||
+            pricePerHour === ''
+        ) {
             return res.status(400).json({
                 success: false,
                 message: 'Please provide all required fields'
             });
         }
 
+        if (
+            !isValidNumber(pricePerHour) ||
+            !isValidNumber(securityDeposit ?? 500) ||
+            !isValidNumber(maxCapacity ?? 5, 1) ||
+            !Number.isInteger(Number(maxCapacity ?? 5))
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid price, security deposit or capacity'
+            });
+        }
+
         const newStudio = {
-            title: studioName,
+            title: studioName.trim(),
             category: category || 'General',
             hourlyRate: Number(pricePerHour),
-            securityDeposit: Number(securityDeposit || 500),
-            maxCapacity: Number(maxCapacity || 5),
-            location,
+            securityDeposit: Number(securityDeposit ?? 500),
+            maxCapacity: Number(maxCapacity ?? 5),
+            location: location.trim(),
             overview: description || '',
             imageUrl: image || '',
             ownerEmail: userEmail,
@@ -288,7 +422,8 @@ app.post('/studios', async (req, res) => {
         });
 
     } catch (err) {
-        console.error(err);
+        console.error('Create studio error:', err);
+
         res.status(500).json({
             success: false,
             message: 'Failed to add studio',
@@ -300,38 +435,47 @@ app.post('/studios', async (req, res) => {
 app.get('/studios/my-studios', async (req, res) => {
     try {
         const { email } = req.query;
-        if (!email) {
-            return res.status(400).json({ success: false, message: 'Email query parameter is required' });
+
+        if (!email || typeof email !== 'string') {
+            return res.status(400).json({
+                success: false,
+                message: 'Email query parameter is required'
+            });
         }
-        const query = { $or: [{ ownerEmail: email }, { hostEmail: email }] };
+
+        const query = {
+            $or: [
+                { ownerEmail: email },
+                { hostEmail: email }
+            ]
+        };
+
         const userStudios = await collection.find(query).toArray();
 
-        const now = new Date();
-        const updatedStudios = await Promise.all(userStudios.map(async (studio) => {
-            if (studio.status === 'booked') {
-                const activeBooking = await bookingsCollection.findOne({
-                    studioId: studio._id,
-                    status: { $in: ['pending', 'confirmed'] }
-                });
+        const updatedStudios = await Promise.all(
+            userStudios.map(async (studio) => {
+                let currentStatus = studio.status || 'available';
 
-                if (activeBooking) {
-                    const bookingEndDateTime = new Date(`${activeBooking.bookingDate}T${activeBooking.endTime}:00Z`);
-                    if (now > bookingEndDateTime) {
-                        await collection.updateOne({ _id: studio._id }, { $set: { status: 'available' } });
-                        return { ...studio, status: 'available' };
-                    }
-                } else {
-                    await collection.updateOne({ _id: studio._id }, { $set: { status: 'available' } });
-                    return { ...studio, status: 'available' };
+                if (currentStatus === 'booked') {
+                    currentStatus = await refreshStudioStatus(studio._id);
                 }
-            }
-            return { ...studio, status: studio.status || 'available' };
-        }));
+
+                return {
+                    ...studio,
+                    status: currentStatus
+                };
+            })
+        );
 
         res.status(200).json(updatedStudios);
+
     } catch (err) {
         console.error('Error fetching user studios:', err);
-        res.status(500).json({ success: false, message: 'Internal server error' });
+
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error'
+        });
     }
 });
 
@@ -339,54 +483,164 @@ app.put('/studios/:id', async (req, res) => {
     try {
         const studioId = req.params.id;
 
-        if (!ObjectId.isValid(studioId)) {
-            return res.status(400).json({ message: "Invalid studio ID format" });
+        if (!isValidObjectId(studioId)) {
+            return res.status(400).json({
+                message: 'Invalid studio ID format'
+            });
         }
 
         const updatedData = req.body;
+        const updateFields = {};
 
-        const query = { _id: new ObjectId(studioId) };
+        if (updatedData.title !== undefined) {
+            if (
+                typeof updatedData.title !== 'string' ||
+                !updatedData.title.trim()
+            ) {
+                return res.status(400).json({
+                    message: 'Invalid studio title'
+                });
+            }
+
+            updateFields.title = updatedData.title.trim();
+        }
+
+        if (updatedData.category !== undefined) {
+            updateFields.category = updatedData.category;
+        }
+
+        if (updatedData.hourlyRate !== undefined) {
+            if (!isValidNumber(updatedData.hourlyRate)) {
+                return res.status(400).json({
+                    message: 'Invalid hourly rate'
+                });
+            }
+
+            updateFields.hourlyRate = Number(updatedData.hourlyRate);
+        }
+
+        if (updatedData.securityDeposit !== undefined) {
+            if (!isValidNumber(updatedData.securityDeposit)) {
+                return res.status(400).json({
+                    message: 'Invalid security deposit'
+                });
+            }
+
+            updateFields.securityDeposit = Number(
+                updatedData.securityDeposit
+            );
+        }
+
+        if (updatedData.maxCapacity !== undefined) {
+            if (
+                !isValidNumber(updatedData.maxCapacity, 1) ||
+                !Number.isInteger(Number(updatedData.maxCapacity))
+            ) {
+                return res.status(400).json({
+                    message: 'Invalid maximum capacity'
+                });
+            }
+
+            updateFields.maxCapacity = Number(updatedData.maxCapacity);
+        }
+
+        if (updatedData.location !== undefined) {
+            updateFields.location = updatedData.location;
+        }
+
+        if (updatedData.imageUrl !== undefined) {
+            updateFields.imageUrl = updatedData.imageUrl;
+        }
+
+        if (updatedData.amenities !== undefined) {
+            if (!Array.isArray(updatedData.amenities)) {
+                return res.status(400).json({
+                    message: 'Amenities must be an array'
+                });
+            }
+
+            updateFields.amenities = updatedData.amenities;
+        }
+
+        if (updatedData.description !== undefined) {
+            updateFields.overview = updatedData.description;
+        }
+
+        if (Object.keys(updateFields).length === 0) {
+            return res.status(400).json({
+                message: 'No valid fields provided for update'
+            });
+        }
+
+        updateFields.updatedAt = new Date();
+
+        const query = {
+            _id: new ObjectId(studioId)
+        };
+
         const updateDoc = {
-            $set: {
-                title: updatedData.title,
-                category: updatedData.category,
-                hourlyRate: Number(updatedData.hourlyRate || 0),
-                securityDeposit: Number(updatedData.securityDeposit || 0),
-                maxCapacity: Number(updatedData.maxCapacity || 1),
-                location: updatedData.location,
-                imageUrl: updatedData.imageUrl,
-                amenities: updatedData.amenities,
-                overview: updatedData.description,
-                updatedAt: new Date()
-            },
+            $set: updateFields
         };
 
         const result = await collection.updateOne(query, updateDoc);
 
         if (result.matchedCount === 0) {
-            return res.status(404).json({ message: "Studio not found" });
+            return res.status(404).json({
+                message: 'Studio not found'
+            });
         }
 
-        res.status(200).json({ message: "Studio updated successfully", result });
-    } catch (error) {
-        console.error("Update Studio Error:", error);
-        res.status(500).json({ message: "Failed to update studio", error: error.message });
+        res.status(200).json({
+            message: 'Studio updated successfully',
+            result
+        });
+
+    } catch (err) {
+        console.error('Update studio error:', err);
+
+        res.status(500).json({
+            message: 'Failed to update studio',
+            error: err.message
+        });
     }
 });
 
 app.delete('/studios/:id', async (req, res) => {
     try {
         const id = req.params.id;
-        const query = { _id: new ObjectId(id) };
+
+        if (!isValidObjectId(id)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid studio ID'
+            });
+        }
+
+        const query = {
+            _id: new ObjectId(id)
+        };
+
         const result = await collection.deleteOne(query);
 
         if (result.deletedCount === 0) {
-            return res.status(404).json({ success: false, message: 'Studio not found' });
+            return res.status(404).json({
+                success: false,
+                message: 'Studio not found'
+            });
         }
-        res.status(200).json({ success: true, message: 'Studio deleted successfully' });
+
+        res.status(200).json({
+            success: true,
+            message: 'Studio deleted successfully'
+        });
+
     } catch (err) {
         console.error('Error deleting studio:', err);
-        res.status(500).json({ success: false, message: 'Internal server error' });
+
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error'
+        });
     }
 });
 
@@ -394,7 +648,7 @@ app.get('/studios/:id', async (req, res) => {
     try {
         const id = req.params.id;
 
-        if (!ObjectId.isValid(id)) {
+        if (!isValidObjectId(id)) {
             return res.status(400).json({
                 message: 'Invalid studio ID'
             });
@@ -411,29 +665,19 @@ app.get('/studios/:id', async (req, res) => {
         }
 
         let currentStatus = studio.status || 'available';
-        if (currentStatus === 'booked') {
-            const activeBooking = await bookingsCollection.findOne({
-                studioId: studio._id,
-                status: { $in: ['pending', 'confirmed'] }
-            });
 
-            if (activeBooking) {
-                const now = new Date();
-                const bookingEndDateTime = new Date(`${activeBooking.bookingDate}T${activeBooking.endTime}:00Z`);
-                if (now > bookingEndDateTime) {
-                    await collection.updateOne({ _id: studio._id }, { $set: { status: 'available' } });
-                    currentStatus = 'available';
-                }
-            } else {
-                await collection.updateOne({ _id: studio._id }, { $set: { status: 'available' } });
-                currentStatus = 'available';
-            }
+        if (currentStatus === 'booked') {
+            currentStatus = await refreshStudioStatus(studio._id);
         }
 
-        res.status(200).json({ ...studio, status: currentStatus });
+        res.status(200).json({
+            ...studio,
+            status: currentStatus
+        });
 
     } catch (err) {
-        console.error(err);
+        console.error('Fetch single studio error:', err);
+
         res.status(500).json({
             message: 'Failed to fetch studio',
             error: err.message
@@ -446,14 +690,14 @@ app.delete('/bookings/:id', async (req, res) => {
         const { id } = req.params;
         const { email } = req.query;
 
-        if (!ObjectId.isValid(id)) {
+        if (!isValidObjectId(id)) {
             return res.status(400).json({
                 success: false,
                 message: 'Invalid booking ID'
             });
         }
 
-        if (!email) {
+        if (!email || typeof email !== 'string') {
             return res.status(400).json({
                 success: false,
                 message: 'User email is required'
@@ -474,13 +718,10 @@ app.delete('/bookings/:id', async (req, res) => {
 
         const { bookingDate, startTime, endTime } = booking;
 
-        const datePattern = /^\d{4}-\d{2}-\d{2}$/;
-        const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
-
         if (
-            !datePattern.test(bookingDate) ||
-            !timePattern.test(startTime) ||
-            !timePattern.test(endTime) ||
+            !isValidBookingDate(bookingDate) ||
+            !isValidBookingTime(startTime) ||
+            !isValidBookingTime(endTime) ||
             startTime >= endTime
         ) {
             return res.status(400).json({
@@ -489,8 +730,16 @@ app.delete('/bookings/:id', async (req, res) => {
             });
         }
 
-        const bookingStart = new Date(`${bookingDate}T${startTime}:00+06:00`);
-        const bookingEnd = new Date(`${bookingDate}T${endTime}:00+06:00`);
+        const bookingStart = getBookingDateTime(
+            bookingDate,
+            startTime
+        );
+
+        const bookingEnd = getBookingDateTime(
+            bookingDate,
+            endTime
+        );
+
         const now = new Date();
 
         if (now >= bookingStart && now < bookingEnd) {
@@ -512,19 +761,7 @@ app.delete('/bookings/:id', async (req, res) => {
             });
         }
 
-        const remainingBooking = await bookingsCollection.findOne({
-            studioId: booking.studioId,
-            status: { $in: ['pending', 'confirmed'] }
-        });
-
-        await collection.updateOne(
-            { _id: booking.studioId },
-            {
-                $set: {
-                    status: remainingBooking ? 'booked' : 'available'
-                }
-            }
-        );
+        await refreshStudioStatus(booking.studioId);
 
         res.status(200).json({
             success: true,
@@ -533,6 +770,7 @@ app.delete('/bookings/:id', async (req, res) => {
 
     } catch (err) {
         console.error('Booking deletion error:', err);
+
         res.status(500).json({
             success: false,
             message: 'Failed to delete booking'
@@ -540,7 +778,10 @@ app.delete('/bookings/:id', async (req, res) => {
     }
 });
 
-app.listen(port, () => {
-    console.log(`Server is running smoothly on port ${port}`);
-});
+if (process.env.VERCEL !== '1') {
+    app.listen(port, () => {
+        console.log(`Server is running smoothly on port ${port}`);
+    });
+}
+
 export default app;
