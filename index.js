@@ -1,10 +1,10 @@
 import express from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from 'cors';
-import 'dotenv/config'
+import 'dotenv/config';
 
-const app = express()
-const port = 8000
+const app = express();
+const port = 8000;
 
 app.use(cors({
     origin: 'http://localhost:3000'
@@ -31,13 +31,37 @@ const collection = db.collection('available');
 const bookingsCollection = db.collection('bookings');
 
 app.get('/', (req, res) => {
-    res.send('Hello World!')
-})
+    res.send('Hello World!');
+});
 
+// 🔄 Updated with dynamic expiration check
 app.get('/alldata', async (req, res) => {
     try {
+        const now = new Date();
         const spaces = await collection.find().toArray();
-        res.status(200).json(spaces);
+
+        const updatedSpaces = await Promise.all(spaces.map(async (studio) => {
+            if (studio.status === 'booked') {
+                const activeBooking = await bookingsCollection.findOne({
+                    studioId: studio._id,
+                    status: { $in: ['pending', 'confirmed'] }
+                });
+
+                if (activeBooking) {
+                    const bookingEndDateTime = new Date(`${activeBooking.bookingDate}T${activeBooking.endTime}:00Z`);
+                    if (now > bookingEndDateTime) {
+                        await collection.updateOne({ _id: studio._id }, { $set: { status: 'available' } });
+                        return { ...studio, status: 'available' };
+                    }
+                } else {
+                    await collection.updateOne({ _id: studio._id }, { $set: { status: 'available' } });
+                    return { ...studio, status: 'available' };
+                }
+            }
+            return { ...studio, status: studio.status || 'available' };
+        }));
+
+        res.status(200).json(updatedSpaces);
     } catch (err) {
         console.error(err);
         res.status(500).json({
@@ -45,9 +69,8 @@ app.get('/alldata', async (req, res) => {
             error: err.message
         });
     }
-})
+});
 
-// ড্যাশবোর্ডের জন্য টোটাল স্টুডিও কাউন্ট রাউট (এটি মিসিং ছিল)
 app.get('/spaces', async (req, res) => {
     try {
         const spaces = await collection.find().toArray();
@@ -59,40 +82,8 @@ app.get('/spaces', async (req, res) => {
             error: err.message
         });
     }
-})
+});
 
-app.get('/studios/:id', async (req, res) => {
-    try {
-        const id = req.params.id;
-
-        if (!ObjectId.isValid(id)) {
-            return res.status(400).json({
-                message: 'Invalid studio ID'
-            });
-        }
-
-        const studio = await collection.findOne({
-            _id: new ObjectId(id)
-        });
-
-        if (!studio) {
-            return res.status(404).json({
-                message: 'Studio not found'
-            });
-        }
-
-        res.status(200).json(studio);
-
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({
-            message: 'Failed to fetch studio',
-            error: err.message
-        });
-    }
-})
-
-// Create Booking
 app.post('/bookings', async (req, res) => {
     console.log("BACKEND RECEIVED BODY:", req.body);
     try {
@@ -103,7 +94,6 @@ app.post('/bookings', async (req, res) => {
             endTime
         } = req.body;
 
-        // Input validation
         if (!studioId || !bookingDate || !startTime || !endTime) {
             return res.status(400).json({
                 message: 'Please provide all required information'
@@ -116,7 +106,6 @@ app.post('/bookings', async (req, res) => {
             });
         }
 
-        // Validate date
         const datePattern = /^\d{4}-\d{2}-\d{2}$/;
         const date = new Date(`${bookingDate}T00:00:00Z`);
 
@@ -130,7 +119,6 @@ app.post('/bookings', async (req, res) => {
             });
         }
 
-        // Validate time
         const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
 
         if (
@@ -143,7 +131,6 @@ app.post('/bookings', async (req, res) => {
             });
         }
 
-        // Check if studio exists
         const studio = await collection.findOne({
             _id: new ObjectId(studioId)
         });
@@ -154,7 +141,6 @@ app.post('/bookings', async (req, res) => {
             });
         }
 
-        // Check time-slot conflict
         const existingBooking = await bookingsCollection.findOne({
             studioId: new ObjectId(studioId),
             bookingDate,
@@ -169,7 +155,6 @@ app.post('/bookings', async (req, res) => {
             });
         }
 
-        // Save booking
         const booking = {
             ...req.body,
             studioId: new ObjectId(studioId),
@@ -178,6 +163,11 @@ app.post('/bookings', async (req, res) => {
         };
 
         const result = await bookingsCollection.insertOne(booking);
+
+        await collection.updateOne(
+            { _id: new ObjectId(studioId) },
+            { $set: { status: 'booked' } }
+        );
 
         res.status(201).json({
             success: true,
@@ -193,9 +183,8 @@ app.post('/bookings', async (req, res) => {
             error: err.message
         });
     }
-})
+});
 
-// Get Bookings by User Email
 app.get('/bookings/my-bookings', async (req, res) => {
     try {
         const userEmail = req.query.email;
@@ -222,6 +211,8 @@ app.post('/studios', async (req, res) => {
             studioName,
             category,
             pricePerHour,
+            securityDeposit,
+            maxCapacity,
             location,
             description,
             image,
@@ -229,7 +220,6 @@ app.post('/studios', async (req, res) => {
             userName
         } = req.body;
 
-        // Input validation
         if (!studioName || !pricePerHour || !location || !userEmail) {
             return res.status(400).json({
                 success: false,
@@ -238,14 +228,17 @@ app.post('/studios', async (req, res) => {
         }
 
         const newStudio = {
-            studioName,
+            title: studioName,
             category: category || 'General',
-            pricePerHour: Number(pricePerHour),
+            hourlyRate: Number(pricePerHour),
+            securityDeposit: Number(securityDeposit || 500),
+            maxCapacity: Number(maxCapacity || 5),
             location,
-            description: description || '',
-            image: image || '',
-            hostEmail: userEmail,
-            hostName: userName || 'Host',
+            overview: description || '',
+            imageUrl: image || '',
+            ownerEmail: userEmail,
+            ownerName: userName || 'Host',
+            status: 'available',
             createdAt: new Date()
         };
 
@@ -266,24 +259,49 @@ app.post('/studios', async (req, res) => {
         });
     }
 });
+
+// 🔄 Updated with dynamic expiration check for host studios
 app.get('/studios/my-studios', async (req, res) => {
     try {
         const { email } = req.query;
         if (!email) {
             return res.status(400).json({ success: false, message: 'Email query parameter is required' });
         }
-        const query = { ownerEmail: email };
+        const query = { $or: [{ ownerEmail: email }, { hostEmail: email }] };
         const userStudios = await collection.find(query).toArray();
-        res.status(200).json(userStudios);
+
+        const now = new Date();
+        const updatedStudios = await Promise.all(userStudios.map(async (studio) => {
+            if (studio.status === 'booked') {
+                const activeBooking = await bookingsCollection.findOne({
+                    studioId: studio._id,
+                    status: { $in: ['pending', 'confirmed'] }
+                });
+
+                if (activeBooking) {
+                    const bookingEndDateTime = new Date(`${activeBooking.bookingDate}T${activeBooking.endTime}:00Z`);
+                    if (now > bookingEndDateTime) {
+                        await collection.updateOne({ _id: studio._id }, { $set: { status: 'available' } });
+                        return { ...studio, status: 'available' };
+                    }
+                } else {
+                    await collection.updateOne({ _id: studio._id }, { $set: { status: 'available' } });
+                    return { ...studio, status: 'available' };
+                }
+            }
+            return { ...studio, status: studio.status || 'available' };
+        }));
+
+        res.status(200).json(updatedStudios);
     } catch (err) {
         console.error('Error fetching user studios:', err);
         res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
+
 app.delete('/studios/:id', async (req, res) => {
     try {
         const id = req.params.id;
-        const { ObjectId } = require('mongodb');
         const query = { _id: new ObjectId(id) };
         const result = await collection.deleteOne(query);
 
@@ -296,6 +314,169 @@ app.delete('/studios/:id', async (req, res) => {
         res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
+
+// 🔄 Updated with dynamic expiration check for single studio view
+app.get('/studios/:id', async (req, res) => {
+    try {
+        const id = req.params.id;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                message: 'Invalid studio ID'
+            });
+        }
+
+        const studio = await collection.findOne({
+            _id: new ObjectId(id)
+        });
+
+        if (!studio) {
+            return res.status(404).json({
+                message: 'Studio not found'
+            });
+        }
+
+        let currentStatus = studio.status || 'available';
+        if (currentStatus === 'booked') {
+            const activeBooking = await bookingsCollection.findOne({
+                studioId: studio._id,
+                status: { $in: ['pending', 'confirmed'] }
+            });
+
+            if (activeBooking) {
+                const now = new Date();
+                const bookingEndDateTime = new Date(`${activeBooking.bookingDate}T${activeBooking.endTime}:00Z`);
+                if (now > bookingEndDateTime) {
+                    await collection.updateOne({ _id: studio._id }, { $set: { status: 'available' } });
+                    currentStatus = 'available';
+                }
+            } else {
+                await collection.updateOne({ _id: studio._id }, { $set: { status: 'available' } });
+                currentStatus = 'available';
+            }
+        }
+
+        res.status(200).json({ ...studio, status: currentStatus });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({
+            message: 'Failed to fetch studio',
+            error: err.message
+        });
+    }
+});
+app.delete('/bookings/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { email } = req.query;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid booking ID'
+            });
+        }
+
+        if (!email) {
+            return res.status(400).json({
+                success: false,
+                message: 'User email is required'
+            });
+        }
+
+        // Find booking belonging to this user
+        const booking = await bookingsCollection.findOne({
+            _id: new ObjectId(id),
+            userEmail: email
+        });
+
+        if (!booking) {
+            return res.status(404).json({
+                success: false,
+                message: 'Booking not found'
+            });
+        }
+
+        const { bookingDate, startTime, endTime } = booking;
+
+        // Validate date and time
+        const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+        const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+        if (
+            !datePattern.test(bookingDate) ||
+            !timePattern.test(startTime) ||
+            !timePattern.test(endTime) ||
+            startTime >= endTime
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid booking date or time'
+            });
+        }
+
+        // Bangladesh timezone (UTC+06:00)
+        const bookingStart = new Date(
+            `${bookingDate}T${startTime}:00+06:00`
+        );
+
+        const bookingEnd = new Date(
+            `${bookingDate}T${endTime}:00+06:00`
+        );
+
+        const now = new Date();
+
+        // Prevent deletion during active booking
+        if (now >= bookingStart && now < bookingEnd) {
+            return res.status(403).json({
+                success: false,
+                message: 'You cannot delete an active booking.'
+            });
+        }
+
+        // Delete booking
+        const result = await bookingsCollection.deleteOne({
+            _id: new ObjectId(id),
+            userEmail: email
+        });
+
+        if (result.deletedCount === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Booking not found'
+            });
+        }
+
+        // Update studio status based on remaining bookings
+        const remainingBooking = await bookingsCollection.findOne({
+            studioId: booking.studioId,
+            status: { $in: ['pending', 'confirmed'] }
+        });
+
+        await collection.updateOne(
+            { _id: booking.studioId },
+            {
+                $set: {
+                    status: remainingBooking ? 'booked' : 'available'
+                }
+            }
+        );
+
+        res.status(200).json({
+            success: true,
+            message: 'Booking deleted successfully'
+        });
+
+    } catch (err) {
+        console.error('Booking deletion error:', err);
+
+        res.status(500).json({
+            success: false,
+            message: 'Failed to delete booking'
+        });
+    }
+});
 app.listen(port, () => {
-    console.log(`Example app listening on port ${port} `)
-})
+    console.log(`Example app listening on port ${port}`);
+});
