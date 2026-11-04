@@ -2,30 +2,67 @@
 import express from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from 'cors';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 import 'dotenv/config';
 
 const app = express();
 const port = process.env.PORT || 8000;
 
-const allowedOrigins = [
-    process.env.CLIENT_URI,
-    ...(process.env.NODE_ENV !== 'production'
-        ? ['http://localhost:3000', 'http://localhost:3001']
-        : [])
-].filter(Boolean);
-
 app.use(cors({
-    origin: function (origin, callback) {
-        if (!origin || allowedOrigins.includes(origin)) {
-            return callback(null, true);
-        }
-
-        return callback(new Error('Not allowed by CORS'));
-    },
+    origin: process.env.CLIENT_URI,
     credentials: true
 }));
 
 app.use(express.json({ limit: '1mb' }));
+
+// JWT Configuration
+if (!process.env.CLIENT_URI) {
+    throw new Error('CLIENT_URI is missing from environment variables');
+}
+
+const JWKS = createRemoteJWKSet(
+    new URL(`${process.env.CLIENT_URI}/api/auth/jwks`)
+);
+
+// JWT Verification Middleware
+const verifyToken = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({
+            message: 'Unauthorized'
+        });
+    }
+
+    const token = authHeader.split(' ')[1];
+
+    if (!token) {
+        return res.status(401).json({
+            message: 'Unauthorized'
+        });
+    }
+
+    try {
+        const { payload } = await jwtVerify(token, JWKS);
+
+        if (!payload.email || typeof payload.email !== 'string') {
+            return res.status(401).json({
+                message: 'Invalid user token'
+            });
+        }
+
+        req.user = payload;
+
+        next();
+
+    } catch (error) {
+        console.error('JWT verification error:', error);
+
+        return res.status(401).json({
+            message: 'Invalid or expired token'
+        });
+    }
+};
 
 if (!process.env.MONGODB_URI) {
     throw new Error('MONGODB_URI is missing from environment variables');
@@ -181,7 +218,7 @@ app.get('/spaces', async (req, res) => {
     }
 });
 
-app.post('/bookings', async (req, res) => {
+app.post('/bookings', verifyToken, async (req, res) => {
     try {
         const studioId = req.body.studioId || req.body.id;
 
@@ -247,6 +284,7 @@ app.post('/bookings', async (req, res) => {
 
         const booking = {
             ...req.body,
+            userEmail: req.user.email,
             studioId: studioObjectId,
             status: 'pending',
             createdAt: new Date()
@@ -273,16 +311,9 @@ app.post('/bookings', async (req, res) => {
     }
 });
 
-app.get('/bookings/my-bookings', async (req, res) => {
+app.get('/bookings/my-bookings', verifyToken, async (req, res) => {
     try {
-        const userEmail = req.query.email;
-
-        if (!userEmail || typeof userEmail !== 'string') {
-            return res.status(400).json({
-                success: false,
-                message: 'User email is required'
-            });
-        }
+        const userEmail = req.user.email;
 
         const now = new Date();
 
@@ -354,7 +385,7 @@ app.get('/bookings/my-bookings', async (req, res) => {
     }
 });
 
-app.post('/studios', async (req, res) => {
+app.post('/studios', verifyToken, async (req, res) => {
     try {
         const {
             studioName,
@@ -365,7 +396,6 @@ app.post('/studios', async (req, res) => {
             location,
             description,
             image,
-            userEmail,
             userName
         } = req.body;
 
@@ -374,8 +404,6 @@ app.post('/studios', async (req, res) => {
             typeof studioName !== 'string' ||
             !location ||
             typeof location !== 'string' ||
-            !userEmail ||
-            typeof userEmail !== 'string' ||
             pricePerHour === undefined ||
             pricePerHour === null ||
             pricePerHour === ''
@@ -407,7 +435,8 @@ app.post('/studios', async (req, res) => {
             location: location.trim(),
             overview: description || '',
             imageUrl: image || '',
-            ownerEmail: userEmail,
+            amenities: Array.isArray(req.body.amenities) ? req.body.amenities : [],
+            ownerEmail: req.user.email,
             ownerName: userName || 'Host',
             status: 'available',
             createdAt: new Date()
@@ -432,16 +461,9 @@ app.post('/studios', async (req, res) => {
     }
 });
 
-app.get('/studios/my-studios', async (req, res) => {
+app.get('/studios/my-studios', verifyToken, async (req, res) => {
     try {
-        const { email } = req.query;
-
-        if (!email || typeof email !== 'string') {
-            return res.status(400).json({
-                success: false,
-                message: 'Email query parameter is required'
-            });
-        }
+        const email = req.user.email;
 
         const query = {
             $or: [
@@ -479,7 +501,7 @@ app.get('/studios/my-studios', async (req, res) => {
     }
 });
 
-app.put('/studios/:id', async (req, res) => {
+app.put('/studios/:id', verifyToken, async (req, res) => {
     try {
         const studioId = req.params.id;
 
@@ -575,7 +597,11 @@ app.put('/studios/:id', async (req, res) => {
         updateFields.updatedAt = new Date();
 
         const query = {
-            _id: new ObjectId(studioId)
+            _id: new ObjectId(studioId),
+            $or: [
+                { ownerEmail: req.user.email },
+                { hostEmail: req.user.email }
+            ]
         };
 
         const updateDoc = {
@@ -605,7 +631,7 @@ app.put('/studios/:id', async (req, res) => {
     }
 });
 
-app.delete('/studios/:id', async (req, res) => {
+app.delete('/studios/:id', verifyToken, async (req, res) => {
     try {
         const id = req.params.id;
 
@@ -617,7 +643,11 @@ app.delete('/studios/:id', async (req, res) => {
         }
 
         const query = {
-            _id: new ObjectId(id)
+            _id: new ObjectId(id),
+            $or: [
+                { ownerEmail: req.user.email },
+                { hostEmail: req.user.email }
+            ]
         };
 
         const result = await collection.deleteOne(query);
@@ -685,22 +715,15 @@ app.get('/studios/:id', async (req, res) => {
     }
 });
 
-app.delete('/bookings/:id', async (req, res) => {
+app.delete('/bookings/:id', verifyToken, async (req, res) => {
     try {
         const { id } = req.params;
-        const { email } = req.query;
+        const email = req.user.email;
 
         if (!isValidObjectId(id)) {
             return res.status(400).json({
                 success: false,
                 message: 'Invalid booking ID'
-            });
-        }
-
-        if (!email || typeof email !== 'string') {
-            return res.status(400).json({
-                success: false,
-                message: 'User email is required'
             });
         }
 
