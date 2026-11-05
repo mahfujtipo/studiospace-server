@@ -1,4 +1,3 @@
-
 import express from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from 'cors';
@@ -314,22 +313,28 @@ app.post('/bookings', verifyToken, async (req, res) => {
 app.get('/bookings/my-bookings', verifyToken, async (req, res) => {
     try {
         const userEmail = req.user.email;
-
         const now = new Date();
 
         const bookings = await bookingsCollection.find({
             userEmail
         }).toArray();
 
-        const expiredBookingIds = [];
-        const activeBookings = [];
+        const expiredBookings = [];
 
         for (const booking of bookings) {
+            const currentStatus = booking.status?.toLowerCase().trim();
+
+            if (
+                currentStatus === 'cancelled' ||
+                currentStatus === 'completed'
+            ) {
+                continue;
+            }
+
             if (
                 !isValidBookingDate(booking.bookingDate) ||
                 !isValidBookingTime(booking.endTime)
             ) {
-                activeBookings.push(booking);
                 continue;
             }
 
@@ -338,31 +343,36 @@ app.get('/bookings/my-bookings', verifyToken, async (req, res) => {
                 booking.endTime
             );
 
-            if (now > bookingEnd) {
-                expiredBookingIds.push(booking._id);
-            } else {
-                activeBookings.push(booking);
+            if (now >= bookingEnd) {
+                expiredBookings.push(booking);
             }
         }
 
-        if (expiredBookingIds.length > 0) {
-            await bookingsCollection.deleteMany({
-                _id: { $in: expiredBookingIds },
-                userEmail
-            });
+        if (expiredBookings.length > 0) {
+            await Promise.all(
+                expiredBookings.map((booking) =>
+                    bookingsCollection.updateOne(
+                        {
+                            _id: booking._id,
+                            userEmail,
+                            status: { $in: ['pending', 'confirmed'] }
+                        },
+                        {
+                            $set: {
+                                status: 'completed',
+                                completedAt: now
+                            }
+                        }
+                    )
+                )
+            );
 
             const affectedStudioIds = [
                 ...new Map(
-                    bookings
-                        .filter((booking) =>
-                            expiredBookingIds.some(
-                                (id) => id.equals(booking._id)
-                            )
-                        )
-                        .map((booking) => [
-                            booking.studioId.toString(),
-                            booking.studioId
-                        ])
+                    expiredBookings.map((booking) => [
+                        booking.studioId.toString(),
+                        booking.studioId
+                    ])
                 ).values()
             ];
 
@@ -373,7 +383,13 @@ app.get('/bookings/my-bookings', verifyToken, async (req, res) => {
             );
         }
 
-        res.status(200).json(activeBookings);
+        const updatedBookings = await bookingsCollection.find({
+            userEmail
+        }).sort({
+            createdAt: -1
+        }).toArray();
+
+        res.status(200).json(updatedBookings);
 
     } catch (err) {
         console.error('Fetch user bookings error:', err);
@@ -548,9 +564,7 @@ app.put('/studios/:id', verifyToken, async (req, res) => {
                 });
             }
 
-            updateFields.securityDeposit = Number(
-                updatedData.securityDeposit
-            );
+            updateFields.securityDeposit = Number(updatedData.securityDeposit);
         }
 
         if (updatedData.maxCapacity !== undefined) {
@@ -753,6 +767,15 @@ app.delete('/bookings/:id', verifyToken, async (req, res) => {
             });
         }
 
+        const currentStatus = booking.status?.toLowerCase().trim();
+
+        if (currentStatus !== 'pending') {
+            return res.status(403).json({
+                success: false,
+                message: 'Only pending bookings can be cancelled.'
+            });
+        }
+
         const bookingStart = getBookingDateTime(
             bookingDate,
             startTime
@@ -765,22 +788,54 @@ app.delete('/bookings/:id', verifyToken, async (req, res) => {
 
         const now = new Date();
 
-        if (now >= bookingStart && now < bookingEnd) {
+        if (now >= bookingEnd) {
+            await bookingsCollection.updateOne(
+                {
+                    _id: new ObjectId(id),
+                    userEmail: email,
+                    status: 'pending'
+                },
+                {
+                    $set: {
+                        status: 'completed',
+                        completedAt: now
+                    }
+                }
+            );
+
+            await refreshStudioStatus(booking.studioId);
+
             return res.status(403).json({
                 success: false,
-                message: 'You cannot delete an active booking.'
+                message: 'This booking has already been completed.'
             });
         }
 
-        const result = await bookingsCollection.deleteOne({
-            _id: new ObjectId(id),
-            userEmail: email
-        });
-
-        if (result.deletedCount === 0) {
-            return res.status(404).json({
+        if (now >= bookingStart && now < bookingEnd) {
+            return res.status(403).json({
                 success: false,
-                message: 'Booking not found'
+                message: 'You cannot cancel an active booking.'
+            });
+        }
+
+        const result = await bookingsCollection.updateOne(
+            {
+                _id: new ObjectId(id),
+                userEmail: email,
+                status: 'pending'
+            },
+            {
+                $set: {
+                    status: 'cancelled',
+                    cancelledAt: now
+                }
+            }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'Booking status has changed. Please refresh and try again.'
             });
         }
 
@@ -788,15 +843,15 @@ app.delete('/bookings/:id', verifyToken, async (req, res) => {
 
         res.status(200).json({
             success: true,
-            message: 'Booking deleted successfully'
+            message: 'Booking cancelled successfully'
         });
 
     } catch (err) {
-        console.error('Booking deletion error:', err);
+        console.error('Booking cancellation error:', err);
 
         res.status(500).json({
             success: false,
-            message: 'Failed to delete booking'
+            message: 'Failed to cancel booking'
         });
     }
 });
